@@ -1,0 +1,30 @@
+# Template: Spring Boot + layered jar + distroless
+# Expected final size: 120-180 MB
+# Use when: Spring Boot 2.3+ app — layered jars give much better Docker cache hit rate.
+# Build prereq: pom.xml or build.gradle present; mvnw or gradlew checked in.
+
+# syntax=docker/dockerfile:1.7
+
+FROM eclipse-temurin:21-jdk-jammy AS builder
+WORKDIR /src
+
+# Cache deps separately from source
+COPY mvnw .mvn ./
+COPY pom.xml ./
+RUN --mount=type=cache,target=/root/.m2 ./mvnw -B -q dependency:go-offline
+
+COPY src ./src
+RUN --mount=type=cache,target=/root/.m2 \
+    ./mvnw -B -q -DskipTests package && \
+    mkdir -p /unpacked && cd /unpacked && \
+    java -Djarmode=layertools -jar /src/target/*.jar extract
+
+FROM gcr.io/distroless/java21-debian12 AS runtime
+WORKDIR /app
+COPY --from=builder /unpacked/dependencies/ ./
+COPY --from=builder /unpacked/spring-boot-loader/ ./
+COPY --from=builder /unpacked/snapshot-dependencies/ ./
+COPY --from=builder /unpacked/application/ ./
+USER 1000
+EXPOSE 8080
+ENTRYPOINT ["java", "org.springframework.boot.loader.launch.JarLauncher"]

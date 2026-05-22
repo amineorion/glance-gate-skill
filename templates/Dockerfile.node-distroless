@@ -1,0 +1,29 @@
+# Template: Node.js + esbuild + distroless
+# Expected final size: 60-90 MB
+# Use when: the app has no native modules and can be bundled
+# Substitute: <ENTRY> with your real entry path (e.g., src/index.ts)
+
+# syntax=docker/dockerfile:1.7
+
+FROM node:20.11-slim AS builder
+WORKDIR /app
+ENV NODE_ENV=production NPM_CONFIG_FUND=false NPM_CONFIG_AUDIT=false
+
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci
+
+COPY . .
+RUN npx esbuild <ENTRY> \
+      --bundle \
+      --platform=node \
+      --target=node20 \
+      --outfile=dist/server.js \
+      --minify \
+      --legal-comments=none
+
+FROM gcr.io/distroless/nodejs20-debian12 AS runtime
+WORKDIR /app
+COPY --from=builder /app/dist/server.js ./
+USER 1000
+EXPOSE 3000
+CMD ["server.js"]

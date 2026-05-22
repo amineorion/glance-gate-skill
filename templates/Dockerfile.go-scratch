@@ -1,0 +1,30 @@
+# Template: Go + static binary + FROM scratch
+# Expected final size: 8-25 MB
+# Use when: pure-Go app, no CGO dependencies
+# Substitute: <CMD_PATH> with the package containing main (e.g., ./cmd/server)
+
+# syntax=docker/dockerfile:1.7
+
+FROM golang:1.22.5-bookworm AS builder
+WORKDIR /src
+ENV CGO_ENABLED=0 GOOS=linux GOFLAGS="-buildvcs=false"
+
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go mod download
+
+COPY . .
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go build \
+      -trimpath \
+      -ldflags="-s -w -buildid=" \
+      -o /out/app <CMD_PATH>
+
+FROM scratch
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=builder /out/app /app
+USER 1000:1000
+EXPOSE 8080
+ENTRYPOINT ["/app"]

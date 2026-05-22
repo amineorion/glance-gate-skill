@@ -1,0 +1,134 @@
+# Template: Node / TypeScript → esbuild bundle → bun --compile (musl) → alpine
+# Expected final size: 40-60 MB content / 150-200 MB on disk
+# Verified result (edorer/user-api, 113 controllers + 55 workspace plugins):
+#   - 45.35 MB content, 175 MB disk, 10 layers
+#   - 0 CVEs at every severity (Trivy 0.69.1)
+#   - boots to "user-api listening" within 3s, SIGTERM clean exit 190ms
+#
+# Use when:
+#   - The audit (scripts/audit-node-bundle.sh) recommends Tier 0
+#     (no native bindings, no eval, no truly-dynamic imports — generate
+#     a plugins.generated.ts manifest first if needed).
+#
+# Why this beats `FROM scratch`:
+#   - bun's binary is dynamically linked against musl + libstdc++ + libgcc.
+#     `FROM scratch` would need those plus the dynamic loader manually
+#     copied in — fragile, no CVE feed.
+#   - `alpine:3.20+` ships those as separately-patched apk packages
+#     tracked by the alpine secdb feed. Glibc CVEs that Debian marks
+#     `FixedVersion: -` (unfixed in this branch) simply don't apply.
+#
+# Substitute:
+#   <ENTRY>            entry source (e.g., src/main.ts)
+#   <SERVICE_NAME>     pnpm workspace filter target (e.g., @org/service)
+#                      — or remove the pnpm -F step if not a workspace
+#   <ESBUILD_VERSION>  pinned esbuild (e.g., 0.27.7)
+#   <BUN_VERSION>      pinned bun (e.g., 1.3.10)
+#   <NODE_VERSION>     pinned node-bookworm-slim (e.g., 20.18)
+#   <ALPINE_VERSION>   pinned alpine (e.g., 3.20)
+#   <EXTERNALS>        space-separated --external flags for peer deps
+#                      the bundler can't resolve. Common offenders:
+#                        --external:@tensorflow/tfjs-node
+#                        --external:kcors
+#                        --external:bufferutil
+#                        --external:utf-8-validate
+#                        --external:@nestjs/*
+#   <EXPOSE_PORT>      port the server listens on
+#
+# Mandatory esbuild flags (carried in below):
+#   --keep-names           — preserves Function.name + class.name so
+#                            constructor.name lookups (Mongoose schemas,
+#                            decorator-metadata frameworks) still work
+#                            after bundling
+#   --tree-shaking=false   — keeps class declarations whose only "use"
+#                            is a side-effect decorator (e.g., @Model,
+#                            @Entity, @Module in NestJS). Tree-shaking
+#                            otherwise silently drops them
+#   --minify-whitespace    — safe with --keep-names
+#   --minify-syntax        — safe with --keep-names
+
+# syntax=docker/dockerfile:1.7
+
+# ---- Stage 1: install + esbuild bundle (glibc builder, doesn't ship) ----
+FROM node:<NODE_VERSION>-bookworm-slim AS bundle
+WORKDIR /repo
+ENV PNPM_HOME=/pnpm
+ENV PATH=/pnpm:$PATH
+
+# ca-certificates + tzdata copied later into the runtime image.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates tzdata && \
+    rm -rf /var/lib/apt/lists/* && \
+    corepack enable && \
+    npm install -g esbuild@<ESBUILD_VERSION>
+
+COPY . .
+
+# Install. Adapt the install command to the lockfile present.
+RUN --mount=type=cache,id=pkg,target=/root/.cache \
+    if   [ -f pnpm-lock.yaml ];  then pnpm install --frozen-lockfile; \
+    elif [ -f bun.lockb ];       then bun install --frozen-lockfile; \
+    elif [ -f yarn.lock ];       then yarn install --frozen-lockfile; \
+    else                              npm ci; fi
+
+# Optional: pre-compile workspace deps that ship dist/ entries.
+# RUN pnpm -F <workspace-lib> build
+
+WORKDIR /repo/<SERVICE_NAME>
+RUN esbuild <ENTRY> \
+      --bundle \
+      --platform=node \
+      --target=node20 \
+      --format=cjs \
+      --tsconfig=tsconfig.json \
+      --legal-comments=none \
+      --log-level=warning \
+      --keep-names \
+      --tree-shaking=false \
+      --minify-whitespace \
+      --minify-syntax \
+      <EXTERNALS> \
+      --outfile=/out/server.js
+
+# Filesystem layout we'll overlay onto alpine.
+RUN mkdir -p /rootfs/tmp /rootfs/app/uploads && \
+    chmod 1777 /rootfs/tmp && \
+    chown -R 1000:1000 /rootfs/app
+
+# ---- Stage 2: bun compile against musl ---------------------------------
+FROM oven/bun:<BUN_VERSION>-alpine AS compile
+WORKDIR /work
+COPY --from=bundle /out/server.js ./server.js
+ARG TARGETARCH=arm64
+RUN if [ "$TARGETARCH" = "amd64" ]; then BUN_TARGET=bun-linux-x64-musl; \
+    else BUN_TARGET=bun-linux-arm64-musl; fi && \
+    bun build ./server.js \
+      --compile \
+      --minify \
+      --target=$BUN_TARGET \
+      <EXTERNALS> \
+      --outfile=/work/app
+
+# ---- Stage 3: ship on alpine ----------------------------------------
+FROM alpine:<ALPINE_VERSION> AS run
+
+# bun's musl binary depends on libstdc++ + libgcc; the app needs CA roots
+# for outbound TLS and tzdata for non-UTC `Date`s. Adding the app user
+# in the same step keeps the layer count down.
+RUN apk add --no-cache \
+      libstdc++ \
+      libgcc \
+      ca-certificates \
+      tzdata && \
+    addgroup -g 1000 app && \
+    adduser -u 1000 -G app -s /sbin/nologin -D app
+
+COPY --from=bundle  --chown=1000:1000 /rootfs /
+COPY --from=compile --chown=1000:1000 /work/app /app/server
+
+USER 1000:1000
+WORKDIR /app
+ENV NODE_ENV=production \
+    UPLOAD_DIR=/app/uploads
+EXPOSE <EXPOSE_PORT>
+ENTRYPOINT ["/app/server"]

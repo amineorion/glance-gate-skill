@@ -1,0 +1,35 @@
+# Template: Python + slim builder + distroless runtime
+# Expected final size: 100-180 MB
+# Use when: standard Python web app (FastAPI / Flask), with or without numpy/pandas
+# Substitute: <ENTRY> with your real entrypoint (e.g., main.py)
+
+# syntax=docker/dockerfile:1.7
+
+FROM python:3.12-slim AS builder
+WORKDIR /app
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt ./
+RUN pip install --target=/install -r requirements.txt
+
+# Scorched-earth cleanup
+RUN find /install -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true && \
+    find /install -type d -name "tests"       -exec rm -rf {} + 2>/dev/null || true && \
+    find /install -type d -name "test"        -exec rm -rf {} + 2>/dev/null || true && \
+    find /install -type f -name "*.pyc"       -delete && \
+    find /install -type f -name "*.pyo"       -delete
+
+FROM gcr.io/distroless/python3-debian12 AS runtime
+WORKDIR /app
+ENV PYTHONPATH=/app/site-packages \
+    PYTHONDONTWRITEBYTECODE=1
+COPY --from=builder /install /app/site-packages
+COPY . .
+USER 1000
+EXPOSE 8000
+CMD ["<ENTRY>"]

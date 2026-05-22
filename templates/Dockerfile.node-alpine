@@ -1,0 +1,38 @@
+# Template: Node.js + node:slim multi-stage (native-deps friendly fallback)
+# Expected final size: 120-180 MB
+# Use when: app has native modules (sharp, bcrypt, prisma, etc.) OR uses NestJS
+#           decorators that break under esbuild.
+# Substitute: <ENTRY> with your real start command (e.g., dist/main.js)
+
+# syntax=docker/dockerfile:1.7
+
+FROM node:20.11-slim AS builder
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential python3 && rm -rf /var/lib/apt/lists/*
+
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci
+
+COPY . .
+RUN npm run build
+
+FROM node:20.11-slim AS runtime
+WORKDIR /app
+ENV NODE_ENV=production
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --omit=dev && npm cache clean --force && \
+    find node_modules -type f \( \
+      -name "*.map" -o -name "*.d.ts" -o -name "*.md" -o \
+      -name "*.ts" -o -name "CHANGELOG*" -o -name "LICENSE*" \
+    \) -delete && \
+    find node_modules -type d \( \
+      -name "test" -o -name "tests" -o -name "__tests__" -o \
+      -name "docs" -o -name "examples" -o -name ".github" \
+    \) -exec rm -rf {} + 2>/dev/null || true
+
+COPY --from=builder /app/dist ./dist
+USER node
+EXPOSE 3000
+CMD ["node", "<ENTRY>"]
